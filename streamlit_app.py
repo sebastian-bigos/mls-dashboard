@@ -2,163 +2,210 @@ import streamlit as st
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
-import plotly.graph_objects as go
+import re
+import os
+import base64
 import numpy as np
+import plotly.graph_objects as go
 
 st.set_page_config(layout="wide")
 st.title("MLS Dashboard")
 
-# ------------------- DATA SCRAPING -------------------
-def fetch_mls_tables():
-    url = "https://fbref.com/en/comps/22/Major-League-Soccer-Stats"
-    response = requests.get(url)
-    soup = BeautifulSoup(response.content, "html.parser")
-    tables = soup.find_all("table", class_="stats_table")
-    return tables[0], tables[2]  # Eastern = 0, Western = 2
+# --- Scrape ESPN MLS Standings ---
+ESPN_URL = "https://www.espn.com/soccer/standings/_/league/usa.1/group/season/2025"
+headers = {
+    "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+}
+resp = requests.get(ESPN_URL, headers=headers)
+resp.raise_for_status()
 
-def parse_table(table):
-    logos, teams = [], []
-    rows = table.find_all("tr")[1:]
-    for row in rows:
-        squad_cell = row.find("td", {"data-stat": "team"})
-        if squad_cell:
-            img_tag = squad_cell.find("img")
-            if img_tag and img_tag.has_attr("src"):
-                src = img_tag["src"]
-                logo_url = src if src.startswith("http") else "https://fbref.com" + src
-            else:
-                logo_url = None
-            logos.append(logo_url)
-            teams.append(squad_cell.text.strip())
+soup = BeautifulSoup(resp.text, "html.parser")
+tables = soup.find_all("table")
 
-    df = pd.read_html(str(table))[0]
-    df = df.iloc[:len(teams)].copy()
-    df["Logo"] = logos
-    df["Squad"] = teams
-    df["Rank"] = range(1, len(df) + 1)
+names_table = pd.read_html(str(tables[0]))[0]
+stats_table = pd.read_html(str(tables[1]))[0]
 
-    df["GF"] = pd.to_numeric(df["GF"], errors="coerce")
-    df["xG"] = pd.to_numeric(df["xG"], errors="coerce")
-    df["Pts"] = pd.to_numeric(df["Pts"], errors="coerce")
-    df["GD"] = pd.to_numeric(df["GD"], errors="coerce")
+num_teams = len(names_table)
+half = num_teams // 2
+
+def promote_header(df):
+    df = df.copy()
+    df.columns = df.iloc[0].str.strip()
+    df = df[1:].reset_index(drop=True)
     return df
 
-def combine_tables(df1, df2):
-    combined = pd.concat([df1, df2], ignore_index=True)
-    combined = combined.sort_values(by=["Pts", "GD", "GF"], ascending=[False, False, False]).reset_index(drop=True)
-    combined["Rank"] = range(1, len(combined) + 1)
-    return combined
+# --- Local logos folder ---
+TEAM_LOGOS = {abbr: f"logos/{abbr}.png" for abbr in [
+    "ATL","ATX","CHI","CIN","CLB","CLT","COL","DAL","DC","HOU","MIA",
+    "LA","LAFC","MIN","MTL","NE","NSH","NY","NYC","ORL","PHI","POR",
+    "RSL","SD","SJ","SEA","SKC","STL","TOR","VAN"
+]}
 
-# ------------------- SCATTER GRAPH -------------------
-def create_logo_scatter(df, title):
-    fig = go.Figure()
-    for _, row in df.iterrows():
-        if pd.notna(row["GF"]) and pd.notna(row["xG"]):
-            if row["Logo"]:
-                fig.add_layout_image(
-                    dict(
-                        source=row["Logo"],
-                        x=row["xG"], y=row["GF"],
-                        xref="x", yref="y",
-                        sizex=2.5, sizey=2.5,
-                        xanchor="center", yanchor="middle",
-                        sizing="contain", layer="above",
-                    )
-                )
-    valid_df = df.dropna(subset=["GF", "xG"])
-    if not valid_df.empty:
-        m, b = np.polyfit(valid_df["xG"], valid_df["GF"], 1)
-        x_vals = valid_df["xG"].sort_values()
-        fig.add_trace(go.Scatter(
-            x=x_vals, y=m * x_vals + b,
-            mode='lines', line=dict(dash='dash', color='gray'),
-            name='Best Fit'
-        ))
-    fig.update_layout(
-        title=title,
-        xaxis_title="xG (Expected Goals)",
-        yaxis_title="GF (Goals For)",
-        height=600, width=800,
-        xaxis=dict(range=[df["xG"].min() - 1, df["xG"].max() + 1]),
-        yaxis=dict(range=[df["GF"].min() - 1, df["GF"].max() + 1]),
-        showlegend=False,
-    )
-    return fig
+def encode_logo(path):
+    if not path or not os.path.exists(path):
+        return None
+    with open(path, "rb") as f:
+        data = f.read()
+        b64 = base64.b64encode(data).decode()
+        return f"data:image/png;base64,{b64}"
 
-# ------------------- SORTABLE TABLE -------------------
-def render_standings_table_sortable(df, conference_name, table_id, use_colors=True):
+def split_team_col(df):
+    first_col = df.columns[0]
+    ranks, abbrs, teams, logos = [], [], [], []
+
+    exceptions = {
+        "New York Red Bulls": 2,
+        "New England Revolution": 2,
+        "D.C. United": 2,
+        "San Diego FC": 2,
+        "San Jose Earthquakes": 2,
+        "LAFC": 4,
+        "LA Galaxy": 2,
+    }
+
+    for val in df[first_col]:
+        val = str(val).strip()
+        m = re.match(r"^(\d+)", val)
+        rank = int(m.group(1)) if m else None
+        rest = val[len(str(rank)):] if m else val
+
+        abbr_len = 3
+        for name, ln in exceptions.items():
+            if rest.endswith(name):
+                abbr_len = ln
+                break
+
+        abbr = rest[:abbr_len]
+        team_name = rest[abbr_len:].strip()
+
+        ranks.append(rank)
+        abbrs.append(abbr)
+        teams.append(team_name)
+
+        logo_path = TEAM_LOGOS.get(abbr)
+        logos.append(encode_logo(logo_path))
+
+    df = df.drop(columns=[first_col])
+    df.insert(0, "Rank", ranks)
+    df.insert(1, "Abbr", abbrs)
+    df.insert(2, "Team", teams)
+    df.insert(3, "Logo", logos)
+    return df
+
+# --- Build dataframes ---
+east_df = promote_header(names_table.iloc[:half])
+east_stats = promote_header(stats_table.iloc[:half])
+east_df = pd.concat([east_df, east_stats.iloc[:, 1:]], axis=1)
+east_df = split_team_col(east_df)
+
+west_df = promote_header(names_table.iloc[half:])
+west_stats = promote_header(stats_table.iloc[half:])
+west_df = pd.concat([west_df, west_stats.iloc[:, 1:]], axis=1)
+west_df = split_team_col(west_df)
+
+# --- Convert numeric columns dynamically ---
+numeric_cols = [col for col in east_df.columns if col not in ["Rank", "Abbr", "Team", "Logo"]]
+for df in [east_df, west_df]:
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+# --- Save top 1-9 teams per conference for coloring ---
+top_east_teams = east_df.loc[east_df['Rank'] <= 9, 'Team'].tolist()
+top_west_teams = west_df.loc[west_df['Rank'] <= 9, 'Team'].tolist()
+
+# --- Sort and create overall standings ---
+overall_df = pd.concat([east_df, west_df], ignore_index=True)
+overall_df = overall_df.sort_values(
+    by=['P', 'W', 'GD'], ascending=[False, False, False]
+).reset_index(drop=True)
+overall_df['Rank'] = range(1, len(overall_df)+1)
+
+# --- Function to render tables ---
+def render_mls_table(df, table_title, table_id):
+    stat_cols = [col for col in df.columns if col not in ["Rank","Abbr","Team","Logo"]]
     row_count = len(df)
-    table_height = 100 + (row_count * 40)
-    table_html = f"""
+    table_height = 250 + (row_count * 48)
+
+    html = f"""
+    <link rel="stylesheet" type="text/css" 
+          href="https://cdn.datatables.net/1.13.6/css/jquery.dataTables.css">
+    <script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
+    <script type="text/javascript" charset="utf8" 
+            src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.js"></script>
     <style>
-        table.dataframe {{
+        table {{
             border-collapse: collapse;
             width: 100%;
             border-radius: 8px;
             overflow: hidden;
         }}
-        table.dataframe th, table.dataframe td {{
+        th, td {{
             border: 1px solid #ccc;
             padding: 6px;
             text-align: center;
         }}
-        table.dataframe th {{
-            background-color: #f2f2f2;
-            text-align: center;
-        }}
-        table.dataframe tbody tr:hover {{
+        th {{
             background-color: #f5f5f5;
+            font-weight: bold;
+        }}
+        tbody tr:hover {{
+            background-color: #f5f5f5;
+        }}
+        img {{
+            height: 24px;
+            vertical-align: middle;
+            margin-right: 6px;
         }}
     </style>
 
-    <h3 style='margin-bottom:10px;'>{conference_name} Standings</h3>
-    <table id="{table_id}" class="display dataframe" style="width:100%;">
+    <h3 style='margin-bottom:10px;'>{table_title}</h3>
+    <table id="{table_id}" class="display" style="width:100%;">
         <thead>
             <tr>
-                <th>Rank</th><th>Team</th><th>MP</th><th>W</th>
-                <th>D</th><th>L</th><th>GF</th><th>GA</th>
-                <th>GD</th><th>Pts</th>
-            </tr>
-        </thead>
-        <tbody>
+                <th>Rank</th>
+                <th>Team</th>
     """
+    for col in stat_cols:
+        html += f"<th>{col}</th>"
+    html += "</tr></thead><tbody>"
+
     for _, row in df.iterrows():
-        if use_colors:
-            if row["Rank"] <= 4:
-                bgcolor = "#d6f5e0"  # slightly darker green
-            elif row["Rank"] <= 7:
-                bgcolor = "#ffe6cc"  # slightly darker orange
-            elif row["Rank"] <= 9:
-                bgcolor = "#dce6f7"  # slightly darker blue
+        team_name = row['Team']
+        if table_id == "overall_table":
+            if team_name in top_east_teams:
+                orig_rank = east_df.loc[east_df['Team'] == team_name, 'Rank'].values[0]
+            elif team_name in top_west_teams:
+                orig_rank = west_df.loc[west_df['Team'] == team_name, 'Rank'].values[0]
+            else:
+                orig_rank = None
+        else:
+            orig_rank = row['Rank']
+
+        if orig_rank:
+            if orig_rank <= 4:
+                bgcolor = "#d6f5e0"
+            elif orig_rank <= 7:
+                bgcolor = "#ffe6cc"
+            elif orig_rank <= 9:
+                bgcolor = "#dce6f7"
             else:
                 bgcolor = "white"
         else:
             bgcolor = "white"
 
-        team_cell = f"<img src='{row['Logo']}' style='height:22px;vertical-align:middle;margin-right:6px;'> {row['Squad']}"
-        table_html += f"""
-            <tr style="background-color:{bgcolor};">
-                <td>{row['Rank']}</td>
-                <td style="text-align:left;">{team_cell}</td>
-                <td>{row['MP']}</td>
-                <td>{row['W']}</td>
-                <td>{row['D']}</td>
-                <td>{row['L']}</td>
-                <td>{row['GF']}</td>
-                <td>{row['GA']}</td>
-                <td>{row['GD']}</td>
-                <td>{row['Pts']}</td>
-            </tr>
-        """
-    table_html += f"""
-        </tbody>
-    </table>
-    <link rel="stylesheet" type="text/css" 
-          href="https://cdn.datatables.net/1.13.6/css/jquery.dataTables.css">
-    <script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
-    <script type="text/javascript" 
-            charset="utf8" 
-            src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.js"></script>
+        team_cell = f"<img src='{row['Logo']}'>{team_name}" if row['Logo'] else team_name
+        html += f"<tr style='background-color:{bgcolor};'>"
+        html += f"<td>{row['Rank']}</td>"
+        html += f"<td style='text-align:left'>{team_cell}</td>"
+        for col in stat_cols:
+            html += f"<td>{row[col]}</td>"
+        html += "</tr>"
+
+    html += "</tbody></table>"
+
+    html += f"""
     <script>
         $(document).ready( function () {{
             $('#{table_id}').DataTable({{
@@ -171,7 +218,79 @@ def render_standings_table_sortable(df, conference_name, table_id, use_colors=Tr
         }});
     </script>
     """
-    st.components.v1.html(table_html, height=table_height)
+    st.components.v1.html(html, height=table_height)
+
+# --- Function to plot GD vs Points with hover tooltips ---
+def plot_points_vs_gd(df, title):
+    df_plot = df.copy()
+    df_plot["GD"] = pd.to_numeric(df_plot["GD"], errors="coerce")
+    df_plot["P"] = pd.to_numeric(df_plot["P"], errors="coerce")
+
+    x_min, x_max = df_plot["P"].min() - 1, df_plot["P"].max() + 1
+    y_min, y_max = df_plot["GD"].min() - 1, df_plot["GD"].max() + 1
+
+    fig = go.Figure()
+
+    # Add team logos as scatter points
+    for _, row in df_plot.iterrows():
+        if row["Logo"]:
+            fig.add_layout_image(
+                dict(
+                    source=row["Logo"],
+                    x=row["P"],
+                    y=row["GD"],
+                    xref="x",
+                    yref="y",
+                    sizex=3,
+                    sizey=3,
+                    xanchor="center",
+                    yanchor="middle",
+                    layer="above"
+                )
+            )
+
+    # Transparent scatter points for hover tooltips
+    fig.add_trace(
+        go.Scatter(
+            x=df_plot["P"],
+            y=df_plot["GD"],
+            mode="markers",
+            marker=dict(size=20, opacity=0),
+            text=df_plot["Team"],
+            hoverinfo="text",
+            showlegend=False
+        )
+    )
+
+    # Linear regression line
+    x = df_plot["P"].values
+    y = df_plot["GD"].values
+    slope, intercept = np.polyfit(x, y, 1)
+    y_fit = slope * x + intercept
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=y_fit,
+            mode="lines",
+            line=dict(color="red", dash="dash"),
+            name="Best Fit"
+        )
+    )
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="Points (P)",
+        yaxis_title="Goal Difference (GD)",
+        xaxis=dict(range=[x_min, x_max], showgrid=True),
+        yaxis=dict(range=[y_min, y_max], showgrid=True),
+        height=600,
+        template="plotly_white",
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+# --- Streamlit Tabs ---
+tabs = st.tabs(["Eastern Conference", "Western Conference", "Overall MLS Standings"])
 
 def render_key():
     st.markdown("""
@@ -181,25 +300,20 @@ def render_key():
     - <span style="background-color:#dce6f7;">&nbsp;&nbsp;&nbsp;&nbsp;</span> 8-9: Wildcard  
     """, unsafe_allow_html=True)
 
-# ------------------- MAIN APP -------------------
-with st.spinner("Loading MLS data..."):
-    eastern_raw, western_raw = fetch_mls_tables()
-    eastern_df = parse_table(eastern_raw)
-    western_df = parse_table(western_raw)
-    combined_df = combine_tables(eastern_df, western_df)
-
-tabs = st.tabs(["Eastern Conference", "Western Conference", "Overall Standings"])
-
 with tabs[0]:
-    render_standings_table_sortable(eastern_df, "Eastern Conference", "east_table", use_colors=True)
+    render_mls_table(east_df, "Eastern Conference", "east_table")
     render_key()
-    st.plotly_chart(create_logo_scatter(eastern_df, "Eastern Conference: GF vs xG"), use_container_width=True)
+    st.subheader("Eastern Conference: GD vs Points")
+    plot_points_vs_gd(east_df, "Eastern Conference: Points vs Goal Difference")
 
 with tabs[1]:
-    render_standings_table_sortable(western_df, "Western Conference", "west_table", use_colors=True)
+    render_mls_table(west_df, "Western Conference", "west_table")
     render_key()
-    st.plotly_chart(create_logo_scatter(western_df, "Western Conference: GF vs xG"), use_container_width=True)
+    st.subheader("Western Conference: GD vs Points")
+    plot_points_vs_gd(west_df, "Western Conference: Points vs Goal Difference")
 
 with tabs[2]:
-    render_standings_table_sortable(combined_df, "Overall Standings", "combined_table", use_colors=False)
-    st.plotly_chart(create_logo_scatter(combined_df, "Overall: GF vs xG"), use_container_width=True)
+    render_mls_table(overall_df, "Overall MLS Standings", "overall_table")
+    render_key()
+    st.subheader("Overall MLS Standings: GD vs Points")
+    plot_points_vs_gd(overall_df, "Overall MLS Standings: Points vs Goal Difference")
